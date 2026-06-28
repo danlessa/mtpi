@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- mtpi project ---
+# Large geodata: raw DEM tiles, intermediates, and rendered outputs are not tracked.
+data/raw/
+data/interim/
+data/out/
+*.tif
+*.tiff
+*.vrt
+.DS_Store
+# keep small committed previews if explicitly added with `git add -f`
+!docs/**/*.png
+.vscode/
+*.pxd

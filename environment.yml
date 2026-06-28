@@ -1,0 +1,16 @@
+name: mtpi
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - gdal>=3.10
+  - rasterio>=1.4
+  - rioxarray
+  - xarray
+  - geopandas
+  - numpy>=2
+  - scipy
+  - matplotlib
+  - whitebox>=2.3
+  # cloud data access (FABDEM lives in gs://telhas/fabdem)
+  - google-cloud-sdk   # provides gsutil/gcloud; or install separately
