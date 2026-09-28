@@ -9,6 +9,11 @@ NoData = -9999.  Pixel *centres* sit on whole arc-seconds (row 0 at the
 tile's north edge latitude), so neighbouring tiles abut with no overlap.
 Sea inside a land tile is stored as 0 m; all-ocean cells have no file.
 
+FABDEM derives from the 2021 Copernicus GLO-30 release, which withheld Armenia
+and Azerbaijan.  Those cells (``FILL_CELLS``) come from the 2023_1 GLO-30
+release (which includes them), on the same grid, via ``python -m mtpi.fill``
+into ``FILL_DIR``.
+
 License note: FABDEM is CC BY-NC-SA 4.0 -- non-commercial use only.
 """
 
@@ -25,6 +30,17 @@ from pathlib import Path
 FABDEM_BASE_URL = "https://fabdem.pedalhidrografi.co/"
 FABDEM_SUFFIX = "_FABDEM_V1-2.tif"
 FABDEM_NODATA = -9999.0
+FILL_DIR = Path(__file__).resolve().parents[2] / "data" / "raw" / "fill"
+FILL_SUFFIX = "_COP30.tif"
+
+# 1 deg cells (SW corners) with no FABDEM file that COP30 2023_1 covers: the
+# Armenia/Azerbaijan gap.
+FILL_CELLS: frozenset[tuple[int, int]] = frozenset({
+    (38, 45), (38, 46), (38, 48), (38, 49),
+    (39, 44), (39, 45), (39, 46), (39, 47), (39, 48), (39, 49),
+    (40, 43), (40, 44), (40, 45), (40, 46), (40, 47), (40, 48), (40, 49), (40, 50),
+    (41, 43), (41, 44), (41, 45), (41, 46), (41, 47), (41, 48), (41, 49),
+})
 
 
 def _tile_name(lat: int, lon: int) -> str:
@@ -54,6 +70,27 @@ def land_cells() -> frozenset[tuple[int, int]]:
         lon = int(line[4:7]) * (1 if line[3] == "E" else -1)
         cells.add((lat, lon))
     return frozenset(cells)
+
+
+def fill_path(lat: int, lon: int) -> Path:
+    """Local COP30 fill COG for the cell whose SW corner is (lat, lon)."""
+    return FILL_DIR / _tile_name(lat, lon).replace(FABDEM_SUFFIX, FILL_SUFFIX)
+
+
+@cache
+def dem_cells() -> frozenset[tuple[int, int]]:
+    """Every cell with elevation data: FABDEM land cells plus the COP30 fill."""
+    return land_cells() | FILL_CELLS
+
+
+def tile_source(lat: int, lon: int) -> str:
+    """GDAL path of the elevation tile for (lat, lon): FABDEM COG or COP30 fill."""
+    if (lat, lon) in FILL_CELLS:
+        path = fill_path(lat, lon)
+        if not path.exists():
+            raise FileNotFoundError(f"{path} missing: run `python -m mtpi.fill`")
+        return str(path)
+    return "/vsicurl/" + tile_url(lat, lon)
 
 
 @dataclass(frozen=True)

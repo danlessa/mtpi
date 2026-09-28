@@ -19,7 +19,7 @@ import numpy as np
 import rasterio
 
 from mtpi.tiled import (
-    DEFAULT_SCALES_M, DY, N, cell_name, land_cells, read_cell, wrap_lon,
+    DEFAULT_SCALES_M, DY, N, cell_name, dem_cells, read_cell, wrap_lon,
 )
 
 
@@ -53,7 +53,7 @@ def main() -> None:
     args = p.parse_args()
     rng = np.random.default_rng(args.seed)
     scales = DEFAULT_SCALES_M
-    by_name = {cell_name(c): c for c in land_cells()}
+    by_name = {cell_name(c): c for c in dem_cells()}
 
     for name in args.cells:
         cell = by_name[name]

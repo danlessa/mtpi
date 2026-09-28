@@ -22,7 +22,9 @@ Longitude wraps across the antimeridian.
 
 Sea is null: FABDEM stores sea inside land tiles as exactly 0 m and has no file
 for all-ocean cells; both are excluded from every window's statistics and are
-transparent in the output.
+transparent in the output.  The Caspian, which FABDEM stores as a flat -28.0 m
+surface, is treated as sea too (see `flat_surface`).  FABDEM's Armenia/
+Azerbaijan gap is filled from Copernicus GLO-30 2023_1 (`mtpi.fill`).
 
 Outputs, one file per cell under ``out_dir`` (so regional runs accumulate into
 one global tree)::
@@ -59,7 +61,9 @@ from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.windows import Window
 
-from .data import FABDEM_NODATA, FABDEM_SUFFIX, _tile_name, land_cells, tile_url
+from .data import (
+    FABDEM_NODATA, FABDEM_SUFFIX, _tile_name, dem_cells, tile_source,
+)
 from .render import ARTWORK_RGB, _stretch_abs
 
 # Remote COG reads: don't list the "directory", retry transient HTTP errors.
@@ -147,6 +151,35 @@ def _open_retry(url: str, tries: int = 3):
             time.sleep(2 * (i + 1))
 
 
+# FABDEM stores the Caspian as a flat surface at exactly this level.  Land below
+# sea level around it can hit the same value, but never flat over ~2 km.
+CASPIAN_LEVEL = -28.0
+CASPIAN_CELLS = (36, 48, 46, 56)  # lat [36, 48) x lon [46, 56): cells touching it
+FLAT_SIDE = 65  # px (~2 km): side of the all-level square that marks a water surface
+
+
+def _square_sums(m: np.ndarray, side: int) -> np.ndarray:
+    """Sums over every side x side square, indexed by its top-left pixel."""
+    I = _integral(m)
+    return I[side:, side:] - I[:-side, side:] - I[side:, :-side] + I[:-side, :-side]
+
+
+def flat_surface(z: np.ndarray, level: float, side: int = FLAT_SIDE) -> np.ndarray:
+    """Pixels inside some side x side square lying entirely at exactly `level`.
+
+    A morphological opening of ``z == level``: keeps large water surfaces and
+    drops small patches of land that happen to share the value.  Uses only
+    `z`, so a whole tile always gets the same mask however it is read.
+    """
+    full = _square_sums(z == level, side) == side * side
+    return _square_sums(np.pad(full, side - 1), side) > 0
+
+
+def _in_caspian(cell: Cell) -> bool:
+    lat0, lat1, lon0, lon1 = CASPIAN_CELLS
+    return lat0 <= cell[0] < lat1 and lon0 <= cell[1] < lon1
+
+
 def _clean(z: np.ndarray) -> np.ndarray:
     """FABDEM nodata and sea (exactly 0 m) -> NaN, in place."""
     z[(z <= FABDEM_NODATA + 1) | (z == 0)] = np.nan
@@ -155,11 +188,17 @@ def _clean(z: np.ndarray) -> np.ndarray:
 
 def read_cell(cell: Cell, window: Window | None = None) -> np.ndarray:
     """Float32 elevations of `cell` (optionally a window), invalid as NaN."""
-    if cell not in land_cells():
+    if cell not in dem_cells():
         h, w = (N, N) if window is None else (window.height, window.width)
         return np.full((h, w), np.nan, np.float32)
-    with _open_retry("/vsicurl/" + tile_url(*cell)) as src:
-        z = src.read(1, window=window).astype(np.float32)
+    caspian = _in_caspian(cell)
+    with _open_retry(tile_source(*cell)) as src:
+        # The Caspian mask needs the whole tile to be the same from every reader.
+        z = src.read(1, window=None if caspian else window).astype(np.float32)
+    if caspian:
+        z[flat_surface(z, CASPIAN_LEVEL)] = np.nan
+        if window is not None:
+            z = z[window.toslices()]
     return _clean(z)
 
 
@@ -266,7 +305,7 @@ def run_coarse(cell: Cell, cfg: Config) -> tuple[Cell, float]:
 
 def _load_coarse(cfg: Config, cell: Cell) -> np.ndarray:
     nb = N // cfg.block
-    if cell not in land_cells():
+    if cell not in dem_cells():
         return np.zeros((3, nb, nb), np.float32)
     return np.load(coarse_path(cfg, cell))
 
@@ -294,7 +333,7 @@ def pass1_cells(targets: list[Cell], cfg: Config) -> list[Cell]:
         for dlat in range(-ky, ky + 1):
             for dlon in range(-kx, kx + 1):
                 c = (lat + dlat, wrap_lon(lon + dlon))
-                if c in land_cells():
+                if c in dem_cells():
                     need.add(c)
     return sorted(need)
 
@@ -370,7 +409,7 @@ def fine_dev(cell: Cell, cfg: Config) -> tuple[np.ndarray, float, dict[str, np.n
 
 
 def _write_cog(path: Path, arr: np.ndarray, cell: Cell, colorinterp=None,
-               nodata=None, **opts) -> None:
+               nodata=None, tags: dict | None = None, **opts) -> None:
     profile = dict(driver="GTiff", width=N, height=N, count=arr.shape[0], dtype=arr.dtype,
                    crs="EPSG:4326", transform=cell_transform(cell), nodata=nodata)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,6 +418,8 @@ def _write_cog(path: Path, arr: np.ndarray, cell: Cell, colorinterp=None,
         ds.write(arr)
         if colorinterp:
             ds.colorinterp = colorinterp
+        if tags:
+            ds.update_tags(**tags)
         rasterio.shutil.copy(ds, tmp, driver="COG", blocksize=512,
                              overview_resampling="average", **opts)
     tmp.replace(path)
@@ -476,7 +517,7 @@ def cells_in_bbox(west: float, south: float, east: float, north: float) -> list[
         (lat, lon)
         for lat in range(math.floor(south), math.ceil(north))
         for lon in range(math.floor(west), math.ceil(east))
-        if (lat, wrap_lon(lon)) in land_cells()
+        if (lat, wrap_lon(lon)) in dem_cells()
     )
 
 
@@ -528,7 +569,7 @@ def main(argv: list[str] | None = None) -> None:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     g.add_argument("--cells", nargs="+", metavar="CELL", help="e.g. S26W050 N61E006")
-    g.add_argument("--world", action="store_true", help="every FABDEM land cell")
+    g.add_argument("--world", action="store_true", help="every cell with elevation data")
     p.add_argument("--scales", nargs=3, type=float, metavar=("MICRO", "MESO", "MACRO"))
     p.add_argument("--block", type=int, default=30, help="coarse block side, px")
     p.add_argument("--clip", type=float, default=2.0)
@@ -547,11 +588,11 @@ def main(argv: list[str] | None = None) -> None:
         p.error("--preview reads local outputs; it can't be combined with --dest")
 
     if args.world:
-        targets = sorted(land_cells())
+        targets = sorted(dem_cells())
     elif args.bbox:
         targets = cells_in_bbox(*args.bbox)
     else:
-        by_name = {cell_name(c): c for c in land_cells()}
+        by_name = {cell_name(c): c for c in dem_cells()}
         targets = sorted(by_name[n] for n in args.cells)
 
     scales = dict(DEFAULT_SCALES_M) if args.scales is None else dict(
