@@ -514,7 +514,8 @@ def fine_dev(cell: Cell, cfg: Config) -> tuple[np.ndarray, float, dict[str, np.n
 
 
 def _write_cog(path: Path, arr: np.ndarray, cell: Cell, colorinterp=None,
-               nodata=None, tags: dict | None = None, descriptions=None, **opts) -> None:
+               nodata=None, tags: dict | None = None, descriptions=None, scales=None,
+               **opts) -> None:
     profile = dict(driver="GTiff", width=N, height=N, count=arr.shape[0], dtype=arr.dtype,
                    crs="EPSG:4326", transform=cell_transform(cell), nodata=nodata)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -527,6 +528,8 @@ def _write_cog(path: Path, arr: np.ndarray, cell: Cell, colorinterp=None,
             ds.update_tags(**tags)
         for i, d in enumerate(descriptions or [], 1):
             ds.set_band_description(i, d)
+        if scales:  # value = stored * scale (GDAL/QGIS apply it when unscaling)
+            ds.scales = scales
         rasterio.shutil.copy(ds, tmp, driver="COG", blocksize=512,
                              overview_resampling="average", **opts)
     tmp.replace(path)

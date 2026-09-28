@@ -7,7 +7,8 @@ the products need, reduced to DEVmax per band, and written as every product:
     v2   R = DEVmax 300-3000 km, G = 30-300 km, B = 3-30 km
 
 per product: ``rgb/<cell>.tif`` (RGBA COG), ``dev/<cell>.tif`` (int16 DEVmax x
-1000, band descriptions name the ranges) and XYZ tile fragments for
+100, i.e. 0.01 z steps -- finer than one colour level -- with GDAL scale 0.01
+and band descriptions naming the ranges) and XYZ tile fragments for
 ``mtpi.xyz``.  Band sampling density is per range: dense where scales are
 cheap (coarse grids), sparser where they cost full-resolution passes.
 
@@ -42,6 +43,9 @@ BANDS: dict[str, tuple[float, float, int]] = {
     "30-300km": (3e4, 3e5, 12),
     "300-3000km": (3e5, 3e6, 12),
 }
+
+
+DEV_SCALE = 100  # stored int16 = round(DEVmax * DEV_SCALE)
 
 
 @dataclass(frozen=True)
@@ -111,11 +115,11 @@ def run_cell(cell: Cell, job: Job) -> tuple[Cell, float]:
     alpha = np.where(valid, 255, 0).astype(np.uint8)
     for p in todo:
         cfg = job.cfg(p)
-        dev = np.stack([np.where(valid, np.round(mx[k] * 1000).clip(-32767, 32767), -32768)
+        dev = np.stack([np.where(valid, np.round(mx[k] * DEV_SCALE).clip(-32767, 32767), -32768)
                         for k in p.dev]).astype(np.int16)
         tiled._write_cog(tiled.dev_path(cfg, cell), dev, cell, nodata=-32768,
                          descriptions=[f"DEVmax {k}" for k in p.dev],
-                         compress="zstd", predictor="yes")
+                         scales=[1 / DEV_SCALE] * len(p.dev), compress="zstd", predictor="yes")
         tiled._publish(cfg, tiled.dev_path(cfg, cell))
         rgba = np.stack([_stretch_abs(np.nan_to_num(mx[k]), valid, job.clip) for k in p.rgb] + [alpha])
         if job.xyz_zoom is not None:
