@@ -32,6 +32,9 @@ one global tree)::
     rgb/<cell>.tif   RGBA uint8 COG (R=macro, G=meso, B=micro |DEV|, A=land)
     dev/<cell>.tif   optional int16 COG, DEV x 1000 per scale (micro, meso, macro)
 
+With ``--xyz-zoom Z`` each cell also leaves Web Mercator tile fragments for
+``mtpi.xyz`` to assemble into an XYZ pyramid afterwards.
+
 With ``--dest s3://bucket/prefix`` each file is uploaded as soon as it is
 written and the local copy deleted, so local disk only holds the block-stats
 cache (~3 GB for the globe).  Works with Cloudflare R2 (or any S3 API) via
@@ -94,6 +97,8 @@ class Config:
     coarse_dir: Path = DATA / "interim" / "coarse"
     out_dir: Path = DATA / "out" / "tiled"
     dest: str | None = None  # s3://bucket/prefix to stream outputs to (then delete local)
+    xyz_zoom: int | None = None  # also cut XYZ tile fragments at this zoom (see mtpi.xyz)
+    frag_dir: Path = DATA / "interim" / "xyz_frag"
     overwrite: bool = False
 
     def fine_scales(self) -> dict[str, float]:
@@ -480,11 +485,16 @@ def _publish(cfg: Config, path: Path) -> None:
     path.unlink()
 
 
+def _frag_marker(cfg: Config, cell: Cell) -> Path:
+    return cfg.frag_dir / "done" / str(cfg.xyz_zoom) / cell_name(cell)
+
+
 def run_cell(cell: Cell, cfg: Config) -> tuple[Cell, float]:
     t = time.perf_counter()
     out = rgb_path(cfg, cell)
     # The RGB COG is written (and uploaded) last, so its presence means done.
-    if not cfg.overwrite and _done(cfg, out):
+    frags_done = cfg.xyz_zoom is None or _frag_marker(cfg, cell).exists()
+    if not cfg.overwrite and frags_done and _done(cfg, out):
         return cell, 0.0
 
     zc, ref, devs = fine_dev(cell, cfg)
@@ -500,9 +510,18 @@ def run_cell(cell: Cell, cfg: Config) -> tuple[Cell, float]:
 
     rgb = [_stretch_abs(devs[k], valid, cfg.clip) for k in ARTWORK_RGB]
     alpha = np.where(valid, 255, 0).astype(np.uint8)
+    rgba = np.stack(rgb + [alpha])
+    if cfg.xyz_zoom is not None:
+        from .xyz import cell_fragments, write_fragments
+
+        write_fragments(cell_fragments(rgba, cell, cfg.xyz_zoom), cell_name(cell),
+                        cfg.frag_dir, cfg.xyz_zoom)
+        _frag_marker(cfg, cell).parent.mkdir(parents=True, exist_ok=True)
+        _frag_marker(cfg, cell).touch()
+
     opts = (dict(compress="webp", quality=cfg.quality) if cfg.codec == "webp"
             else dict(compress="deflate", predictor="yes"))
-    _write_cog(out, np.stack(rgb + [alpha]), cell,
+    _write_cog(out, rgba, cell,
                colorinterp=[ColorInterp.red, ColorInterp.green, ColorInterp.blue,
                             ColorInterp.alpha], **opts)
     _publish(cfg, out)
@@ -523,25 +542,41 @@ def cells_in_bbox(west: float, south: float, east: float, north: float) -> list[
 
 def _star(args):
     fn, cell, cfg = args
-    return fn(cell, cfg)
+    try:
+        return (*fn(cell, cfg), None)
+    except Exception as e:  # one bad cell (network, corrupt tile) must not stop the run
+        return cell, 0.0, f"{type(e).__name__}: {e}"
 
 
-def _map(fn, cells: list[Cell], cfg: Config, workers: int, label: str) -> list[float]:
-    times, t0 = [], time.perf_counter()
+def _map(fn, cells: list[Cell], cfg: Config, workers: int, label: str) -> list[Cell]:
+    """Run `fn` over `cells`; returns the cells that failed (rerun to retry them)."""
+    failed, t0 = [], time.perf_counter()
     with Pool(workers) as pool:
-        for i, (cell, dt) in enumerate(pool.imap_unordered(_star, [(fn, c, cfg) for c in cells]), 1):
-            times.append(dt)
-            print(f"[{label}] {i}/{len(cells)} {cell_name(cell)} {dt:.1f}s", flush=True)
+        jobs = [(fn, c, cfg) for c in cells]
+        for i, (cell, dt, err) in enumerate(pool.imap_unordered(_star, jobs), 1):
+            if err:
+                failed.append(cell)
+                print(f"[{label}] {i}/{len(cells)} {cell_name(cell)} FAILED {err}", flush=True)
+            else:
+                print(f"[{label}] {i}/{len(cells)} {cell_name(cell)} {dt:.1f}s", flush=True)
     print(f"[{label}] {len(cells)} cells in {time.perf_counter() - t0:.0f}s wall "
-          f"({workers} workers)", flush=True)
-    return times
+          f"({workers} workers, {len(failed)} failed)", flush=True)
+    return failed
 
 
-def run(targets: list[Cell], cfg: Config, workers: int) -> None:
+def run(targets: list[Cell], cfg: Config, workers: int) -> list[Cell]:
+    """Both passes; returns failed cells (rerunning resumes and retries them)."""
     p1 = pass1_cells(targets, cfg)
     print(f"[plan] {len(targets)} target cells; block stats for {len(p1)} cells")
-    _map(run_coarse, p1, cfg, workers, "coarse")
-    _map(run_cell, targets, cfg, workers, "dev")
+    failed1 = set(_map(run_coarse, p1, cfg, workers, "coarse"))
+    # A target whose macro window reaches a cell with no block stats can't be done.
+    blocked = {c for c in targets if failed1 & set(pass1_cells([c], cfg))}
+    failed2 = _map(run_cell, [c for c in targets if c not in blocked], cfg, workers, "dev")
+    failed = sorted(failed1 | blocked | set(failed2))
+    if failed:
+        print(f"[run] {len(failed)} cells failed or blocked: "
+              f"{' '.join(cell_name(c) for c in failed)}", flush=True)
+    return failed
 
 
 def preview(targets: list[Cell], cfg: Config, png: Path, factor: int = 8) -> Path:
@@ -579,6 +614,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--coarse-dir", type=Path, default=Config.coarse_dir)
     p.add_argument("--dest", metavar="s3://BUCKET/PREFIX",
                    help="upload each output (e.g. to R2) and delete the local copy")
+    p.add_argument("--xyz-zoom", type=int, help="also cut XYZ tile fragments at this zoom")
+    p.add_argument("--frag-dir", type=Path, default=Config.frag_dir)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--workers", type=int, default=os.cpu_count())
     p.add_argument("--preview", type=Path,
@@ -599,10 +636,13 @@ def main(argv: list[str] | None = None) -> None:
         zip(("micro", "meso", "macro"), args.scales))
     cfg = Config(scales_m=scales, block=args.block, clip=args.clip, codec=args.codec,
                  keep_dev=args.keep_dev, out_dir=args.out_dir, coarse_dir=args.coarse_dir,
-                 dest=args.dest, overwrite=args.overwrite)
-    run(targets, cfg, args.workers)
+                 dest=args.dest, xyz_zoom=args.xyz_zoom, frag_dir=args.frag_dir,
+                 overwrite=args.overwrite)
+    failed = run(targets, cfg, args.workers)
     if args.preview:
         print(f"[preview] {preview(targets, cfg, args.preview)}")
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
