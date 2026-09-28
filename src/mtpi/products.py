@@ -127,8 +127,6 @@ def run_cell(cell: Cell, job: Job) -> tuple[Cell, float]:
 
             write_fragments(cell_fragments(rgba, cell, job.xyz_zoom), cell_name(cell),
                             cfg.frag_dir, job.xyz_zoom)
-            tiled._frag_marker(cfg, cell).parent.mkdir(parents=True, exist_ok=True)
-            tiled._frag_marker(cfg, cell).touch()
         # RGB last: its presence at the destination marks the product done for this cell.
         tiled._write_cog(tiled.rgb_path(cfg, cell), rgba, cell,
                          colorinterp=[ColorInterp.red, ColorInterp.green, ColorInterp.blue,
@@ -136,6 +134,11 @@ def run_cell(cell: Cell, job: Job) -> tuple[Cell, float]:
                          descriptions=[f"|DEVmax {k}|" for k in p.rgb] + ["land"],
                          **_rgb_opts(job.codec))
         tiled._publish(cfg, tiled.rgb_path(cfg, cell))
+        if job.xyz_zoom is not None:
+            # Marker last: older outputs may already sit at the destination under the
+            # same names, so only the marker proves this run finished the product.
+            tiled._frag_marker(cfg, cell).parent.mkdir(parents=True, exist_ok=True)
+            tiled._frag_marker(cfg, cell).touch()
     return cell, time.perf_counter() - t
 
 
