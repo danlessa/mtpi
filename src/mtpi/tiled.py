@@ -82,6 +82,8 @@ from .render import _stretch_abs
 os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
 os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "5")
 os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "2")
+# GDAL's defaults (429/500/502/503/504) miss Cloudflare's 52x timeouts, seen from R2.
+os.environ.setdefault("GDAL_HTTP_RETRY_CODES", "429,500,502,503,504,520,521,522,523,524")
 
 N = 3600  # pixels per cell side
 R_EARTH = 6_371_008.8
