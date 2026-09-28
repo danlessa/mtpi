@@ -11,6 +11,7 @@ dependencies = [
     "numpy>=2",
     "rasterio>=1.4",
     "matplotlib",
+    "numba>=0.60",
 ]
 
 [project.optional-dependencies]
