@@ -146,10 +146,13 @@ def half_widths(length_m: float, lats: np.ndarray, block: int = 1) -> tuple[int,
 # --------------------------------------------------------------------------- reading
 
 
-def _open_retry(url: str, tries: int = 3):
+def _read_retry(path: str, window: Window | None, tries: int = 4) -> np.ndarray:
+    """Band 1 of `path` (optionally a window); retries the open *and* the read,
+    since a remote COG can fail mid-read after opening fine."""
     for i in range(tries):
         try:
-            return rasterio.open(url)
+            with rasterio.open(path) as src:
+                return src.read(1, window=window)
         except RasterioIOError:
             if i == tries - 1:
                 raise
@@ -197,9 +200,8 @@ def read_cell(cell: Cell, window: Window | None = None) -> np.ndarray:
         h, w = (N, N) if window is None else (window.height, window.width)
         return np.full((h, w), np.nan, np.float32)
     caspian = _in_caspian(cell)
-    with _open_retry(tile_source(*cell)) as src:
-        # The Caspian mask needs the whole tile to be the same from every reader.
-        z = src.read(1, window=None if caspian else window).astype(np.float32)
+    # The Caspian mask needs the whole tile to be the same from every reader.
+    z = _read_retry(tile_source(*cell), None if caspian else window).astype(np.float32)
     if caspian:
         z[flat_surface(z, CASPIAN_LEVEL)] = np.nan
         if window is not None:
