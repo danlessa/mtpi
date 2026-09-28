@@ -15,6 +15,13 @@ deg, 3600 x 3600, one FABDEM COG each) in two passes:
    * *coarse scales* (macro, 300 km: a 5000-px halo would multiply reads ~14x)
      come from the block stats of the surrounding cells, then bilinearly
      upsampled.  Window edges snap to whole blocks -- ~0.3 % of a 300 km window.
+   * *global scales* (>= 1000 km, e.g. 3000 km) would reach ~1,600 cells, so
+     pass 1's block stats are first merged into one global grid of coarser
+     blocks (default 120 px, ~4 km: 10800 x 5400, ~700 MB, memory-mapped so
+     workers share it).  Edge snapping ~0.1 % of a 3000 km window: within
+     0.02 z of a 1 km-block reference (scripts/validate_global.py).  Beyond
+     ~67 deg the window runs past the pole and its half-width is capped at the
+     full circle.
 
 No reprojection: windows are square *in metres*, so the half-height is fixed
 (1" of latitude ~ 30.9 m) and the half-width grows per row as 1/cos(lat).
@@ -29,8 +36,10 @@ Azerbaijan gap is filled from Copernicus GLO-30 2023_1 (`mtpi.fill`).
 Outputs, one file per cell under ``out_dir`` (so regional runs accumulate into
 one global tree)::
 
-    rgb/<cell>.tif   RGBA uint8 COG (R=macro, G=meso, B=micro |DEV|, A=land)
-    dev/<cell>.tif   optional int16 COG, DEV x 1000 per scale (micro, meso, macro)
+    rgb/<cell>.tif   RGBA uint8 COG: |DEV| per scale, largest scale -> R,
+                     smallest -> B (default R=300 km, G=30 km, B=3 km), A=land
+    dev/<cell>.tif   optional int16 COG, DEV x 1000 per scale (band descriptions
+                     name the scales)
 
 With ``--xyz-zoom Z`` each cell also leaves Web Mercator tile fragments for
 ``mtpi.xyz`` to assemble into an XYZ pyramid afterwards.
@@ -67,7 +76,7 @@ from rasterio.windows import Window
 from .data import (
     FABDEM_NODATA, FABDEM_SUFFIX, _tile_name, dem_cells, tile_source,
 )
-from .render import ARTWORK_RGB, _stretch_abs
+from .render import _stretch_abs
 
 # Remote COG reads: don't list the "directory", retry transient HTTP errors.
 os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
@@ -89,11 +98,14 @@ Cell = tuple[int, int]  # (lat, lon) of the SW corner, degrees
 class Config:
     scales_m: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SCALES_M))
     coarse_above_m: float = 100_000.0  # scales >= this use the block stats
+    global_above_m: float = 1_000_000.0  # scales >= this use the global block grid
     block: int = 30  # coarse block side, px (must divide N)
+    global_block: int = 120  # global grid block side, px (multiple of block, divides N)
     clip: float = 2.0
     codec: str = "webp"  # rgb COG compression: webp (lossy) | deflate (lossless)
     quality: int = 90
     keep_dev: bool = False
+    dev_scales: tuple[str, ...] | None = None  # labels to keep in dev/ (None = all)
     coarse_dir: Path = DATA / "interim" / "coarse"
     out_dir: Path = DATA / "out" / "tiled"
     dest: str | None = None  # s3://bucket/prefix to stream outputs to (then delete local)
@@ -105,7 +117,15 @@ class Config:
         return {k: v for k, v in self.scales_m.items() if v < self.coarse_above_m}
 
     def coarse_scales(self) -> dict[str, float]:
-        return {k: v for k, v in self.scales_m.items() if v >= self.coarse_above_m}
+        return {k: v for k, v in self.scales_m.items()
+                if self.coarse_above_m <= v < self.global_above_m}
+
+    def global_scales(self) -> dict[str, float]:
+        return {k: v for k, v in self.scales_m.items() if v >= self.global_above_m}
+
+    def rgb_order(self) -> list[str]:
+        """Scale labels for (R, G, B): largest scale red, smallest blue."""
+        return sorted(self.scales_m, key=self.scales_m.get, reverse=True)
 
 
 # --------------------------------------------------------------------------- grid
@@ -359,6 +379,8 @@ def _upsample(a: np.ndarray, block: int) -> np.ndarray:
 
 def coarse_dev(cell: Cell, zc: np.ndarray, ref: float, cfg: Config) -> dict[str, np.ndarray]:
     """DEV at the coarse scales from block stats. `zc` is the cell minus `ref`."""
+    if not cfg.coarse_scales():
+        return {}
     nb, B = N // cfg.block, cfg.block
     lat, lon = cell
     ky, kx = coarse_reach(cell, cfg)
@@ -391,6 +413,80 @@ def coarse_dev(cell: Cell, zc: np.ndarray, ref: float, cfg: Config) -> dict[str,
     return out
 
 
+def global_path(cfg: Config) -> Path:
+    return cfg.coarse_dir / f"global_b{cfg.global_block}.npy"
+
+
+def build_global(cfg: Config) -> Path:
+    """Merge every cell's block stats into one global (3, 180*k, 360*k) grid.
+
+    Blocks of ``global_block`` px (k = N // global_block per degree) combine the
+    finer blocks exactly: counts add, and mean/variance follow from the summed
+    first and second moments.  Row 0 is the north edge (90 deg), column 0 is
+    -180 deg.
+    """
+    k, g = N // cfg.global_block, cfg.global_block // cfg.block
+    grid = np.zeros((3, 180 * k, 360 * k), np.float32)
+    missing = []
+    for lat, lon in sorted(dem_cells()):
+        path = coarse_path(cfg, (lat, lon))
+        if not path.exists():
+            missing.append(cell_name((lat, lon)))
+            continue
+        n, m, v = np.load(path).astype(np.float64)
+        n_ = n.reshape(k, g, k, g).sum(axis=(1, 3))
+        s_ = (n * m).reshape(k, g, k, g).sum(axis=(1, 3))
+        q_ = (n * (v + m * m)).reshape(k, g, k, g).sum(axis=(1, 3))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = s_ / n_
+            var = np.maximum(q_ / n_ - mean * mean, 0.0)
+        r, c = (89 - lat) * k, (lon + 180) * k
+        grid[:, r:r + k, c:c + k] = np.stack([n_, np.nan_to_num(mean), np.nan_to_num(var)])
+    if missing:
+        raise FileNotFoundError(f"no block stats for {len(missing)} cells "
+                                f"(rerun pass 1): {' '.join(missing[:20])}")
+    path = global_path(cfg)
+    tmp = path.with_suffix(".tmp.npy")
+    np.save(tmp, grid)
+    tmp.replace(path)
+    return path
+
+
+_GLOBAL: dict[str, np.ndarray] = {}
+
+
+def global_dev(cell: Cell, zc: np.ndarray, ref: float, cfg: Config) -> dict[str, np.ndarray]:
+    """DEV at the global scales from the global block grid (see `build_global`)."""
+    if not cfg.global_scales():
+        return {}
+    key = str(global_path(cfg))
+    if key not in _GLOBAL:  # memory-mapped: workers share one copy via the page cache
+        _GLOBAL[key] = np.load(key, mmap_mode="r")
+    grid = _GLOBAL[key]
+    H, W = grid.shape[1:]
+    B, nb = cfg.global_block, N // cfg.global_block
+    lat, lon = cell
+    lats = row_lats(lat, np.arange(-1, nb + 1), B)
+    r_t, c_t = (89 - lat) * nb - 1, (lon + 180) * nb - 1  # first centre, incl. margin
+    out = {}
+    for label, length in cfg.global_scales().items():
+        hy, hx = half_widths(length, lats, B)
+        hx = np.minimum(hx, (W - 1) // 2)  # never wider than the full circle
+        py, px = hy, int(hx.max())
+        rows = np.arange(r_t - py, r_t + nb + 2 + py)
+        cols = np.arange(c_t - px, c_t + nb + 2 + px) % W  # wrap the antimeridian
+        sub = np.zeros((3, rows.size, cols.size))
+        inside = (rows >= 0) & (rows < H)  # beyond the poles: no land
+        sub[:, inside] = grid[:, rows[inside]][:, :, cols]
+        n = sub[0]
+        mean = sub[1] - ref
+        s, q = n * mean, n * (sub[2] + mean * mean)
+        sums = [_window_sums(_integral(a), py, px, nb + 2, nb + 2, hy, hx) for a in (n, s, q)]
+        m, sd = _mean_std(*sums)
+        out[label] = _dev(zc, _upsample(np.nan_to_num(m), B), _upsample(np.nan_to_num(sd), B))
+    return out
+
+
 def fine_dev(cell: Cell, cfg: Config) -> tuple[np.ndarray, float, dict[str, np.ndarray]]:
     """Exact DEV at the fine scales. Returns (cell - ref, ref, {label: dev})."""
     lats = row_lats(cell[0], np.arange(N))
@@ -416,7 +512,7 @@ def fine_dev(cell: Cell, cfg: Config) -> tuple[np.ndarray, float, dict[str, np.n
 
 
 def _write_cog(path: Path, arr: np.ndarray, cell: Cell, colorinterp=None,
-               nodata=None, tags: dict | None = None, **opts) -> None:
+               nodata=None, tags: dict | None = None, descriptions=None, **opts) -> None:
     profile = dict(driver="GTiff", width=N, height=N, count=arr.shape[0], dtype=arr.dtype,
                    crs="EPSG:4326", transform=cell_transform(cell), nodata=nodata)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -427,6 +523,8 @@ def _write_cog(path: Path, arr: np.ndarray, cell: Cell, colorinterp=None,
             ds.colorinterp = colorinterp
         if tags:
             ds.update_tags(**tags)
+        for i, d in enumerate(descriptions or [], 1):
+            ds.set_band_description(i, d)
         rasterio.shutil.copy(ds, tmp, driver="COG", blocksize=512,
                              overview_resampling="average", **opts)
     tmp.replace(path)
@@ -501,16 +599,18 @@ def run_cell(cell: Cell, cfg: Config) -> tuple[Cell, float]:
 
     zc, ref, devs = fine_dev(cell, cfg)
     devs |= coarse_dev(cell, zc, ref, cfg)
+    devs |= global_dev(cell, zc, ref, cfg)
     valid = ~np.isnan(zc)
 
     if cfg.keep_dev:
+        keep = [k for k in cfg.scales_m if cfg.dev_scales is None or k in cfg.dev_scales]
         dev = np.stack([np.where(valid, np.round(devs[k] * 1000).clip(-32767, 32767), -32768)
-                        for k in cfg.scales_m]).astype(np.int16)
-        _write_cog(dev_path(cfg, cell), dev, cell,
-                   nodata=-32768, compress="zstd", predictor="yes")
+                        for k in keep]).astype(np.int16)
+        _write_cog(dev_path(cfg, cell), dev, cell, nodata=-32768, descriptions=keep,
+                   compress="zstd", predictor="yes")
         _publish(cfg, dev_path(cfg, cell))
 
-    rgb = [_stretch_abs(devs[k], valid, cfg.clip) for k in ARTWORK_RGB]
+    rgb = [_stretch_abs(devs[k], valid, cfg.clip) for k in cfg.rgb_order()]
     alpha = np.where(valid, 255, 0).astype(np.uint8)
     rgba = np.stack(rgb + [alpha])
     if cfg.xyz_zoom is not None:
@@ -571,6 +671,9 @@ def run(targets: list[Cell], cfg: Config, workers: int) -> list[Cell]:
     p1 = pass1_cells(targets, cfg)
     print(f"[plan] {len(targets)} target cells; block stats for {len(p1)} cells")
     failed1 = set(_map(run_coarse, p1, cfg, workers, "coarse"))
+    if cfg.global_scales():
+        # Global scales read every cell's block stats: all of pass 1 must exist.
+        print(f"[global] {build_global(cfg)}", flush=True)
     # A target whose macro window reaches a cell with no block stats can't be done.
     blocked = {c for c in targets if failed1 & set(pass1_cells([c], cfg))}
     failed2 = _map(run_cell, [c for c in targets if c not in blocked], cfg, workers, "dev")
@@ -607,11 +710,15 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"))
     g.add_argument("--cells", nargs="+", metavar="CELL", help="e.g. S26W050 N61E006")
     g.add_argument("--world", action="store_true", help="every cell with elevation data")
-    p.add_argument("--scales", nargs=3, type=float, metavar=("MICRO", "MESO", "MACRO"))
+    p.add_argument("--scales", nargs=3, type=float, metavar="M",
+                   help="three window sizes in metres (default 3000 30000 300000); "
+                        "custom scales are labelled like 30km, largest -> red")
     p.add_argument("--block", type=int, default=30, help="coarse block side, px")
     p.add_argument("--clip", type=float, default=2.0)
     p.add_argument("--codec", choices=["webp", "deflate"], default="webp")
     p.add_argument("--keep-dev", action="store_true", help="also write int16 DEV COGs")
+    p.add_argument("--dev-scales", nargs="+", metavar="LABEL",
+                   help="with --keep-dev, only these scales (labels as in --scales, e.g. 3000km)")
     p.add_argument("--out-dir", type=Path, default=Config.out_dir)
     p.add_argument("--coarse-dir", type=Path, default=Config.coarse_dir)
     p.add_argument("--dest", metavar="s3://BUCKET/PREFIX",
@@ -634,10 +741,13 @@ def main(argv: list[str] | None = None) -> None:
         by_name = {cell_name(c): c for c in dem_cells()}
         targets = sorted(by_name[n] for n in args.cells)
 
-    scales = dict(DEFAULT_SCALES_M) if args.scales is None else dict(
-        zip(("micro", "meso", "macro"), args.scales))
+    scales = dict(DEFAULT_SCALES_M) if args.scales is None else {
+        f"{m / 1000:g}km": m for m in args.scales}
+    if args.dev_scales and not set(args.dev_scales) <= set(scales):
+        p.error(f"--dev-scales must be among {list(scales)}")
     cfg = Config(scales_m=scales, block=args.block, clip=args.clip, codec=args.codec,
-                 keep_dev=args.keep_dev, out_dir=args.out_dir, coarse_dir=args.coarse_dir,
+                 keep_dev=args.keep_dev,
+                 dev_scales=tuple(args.dev_scales) if args.dev_scales else None, out_dir=args.out_dir, coarse_dir=args.coarse_dir,
                  dest=args.dest, xyz_zoom=args.xyz_zoom, frag_dir=args.frag_dir,
                  overwrite=args.overwrite)
     failed = run(targets, cfg, args.workers)
