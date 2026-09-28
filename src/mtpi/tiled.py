@@ -30,6 +30,13 @@ one global tree)::
     rgb/<cell>.tif   RGBA uint8 COG (R=macro, G=meso, B=micro |DEV|, A=land)
     dev/<cell>.tif   optional int16 COG, DEV x 1000 per scale (micro, meso, macro)
 
+With ``--dest s3://bucket/prefix`` each file is uploaded as soon as it is
+written and the local copy deleted, so local disk only holds the block-stats
+cache (~3 GB for the globe).  Works with Cloudflare R2 (or any S3 API) via
+boto3's standard environment: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+AWS_ENDPOINT_URL_S3 (``https://<account>.r2.cloudflarestorage.com``) and
+AWS_DEFAULT_REGION=auto.
+
 Run ``python -m mtpi.tiled --help``.
 """
 
@@ -82,6 +89,7 @@ class Config:
     keep_dev: bool = False
     coarse_dir: Path = DATA / "interim" / "coarse"
     out_dir: Path = DATA / "out" / "tiled"
+    dest: str | None = None  # s3://bucket/prefix to stream outputs to (then delete local)
     overwrite: bool = False
 
     def fine_scales(self) -> dict[str, float]:
@@ -384,15 +392,70 @@ def dev_path(cfg: Config, cell: Cell) -> Path:
     return cfg.out_dir / "dev" / f"{cell_name(cell)}.tif"
 
 
+_S3 = None
+
+
+def _s3():
+    """One boto3 client per worker process."""
+    global _S3
+    if _S3 is None:
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        _S3 = boto3.client("s3", config=BotoConfig(retries={"mode": "standard",
+                                                            "max_attempts": 10}))
+    return _S3
+
+
+def _remote(cfg: Config, path: Path) -> tuple[str, str]:
+    """(bucket, key) that local output `path` maps to under `cfg.dest`."""
+    bucket, _, prefix = cfg.dest.removeprefix("s3://").partition("/")
+    rel = path.relative_to(cfg.out_dir).as_posix()
+    return bucket, f"{prefix.strip('/')}/{rel}" if prefix.strip("/") else rel
+
+
+def _done(cfg: Config, path: Path) -> bool:
+    if path.exists():
+        return True
+    if not cfg.dest:
+        return False
+    from botocore.exceptions import ClientError
+
+    try:
+        _s3().head_object(Bucket=(r := _remote(cfg, path))[0], Key=r[1])
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
+def _publish(cfg: Config, path: Path) -> None:
+    """Upload `path` to `cfg.dest` and delete it locally (no-op without dest)."""
+    if not cfg.dest:
+        return
+    bucket, key = _remote(cfg, path)
+    _s3().upload_file(str(path), bucket, key, ExtraArgs={"ContentType": "image/tiff"})
+    path.unlink()
+
+
 def run_cell(cell: Cell, cfg: Config) -> tuple[Cell, float]:
     t = time.perf_counter()
     out = rgb_path(cfg, cell)
-    if out.exists() and not cfg.overwrite:
+    # The RGB COG is written (and uploaded) last, so its presence means done.
+    if not cfg.overwrite and _done(cfg, out):
         return cell, 0.0
 
     zc, ref, devs = fine_dev(cell, cfg)
     devs |= coarse_dev(cell, zc, ref, cfg)
     valid = ~np.isnan(zc)
+
+    if cfg.keep_dev:
+        dev = np.stack([np.where(valid, np.round(devs[k] * 1000).clip(-32767, 32767), -32768)
+                        for k in cfg.scales_m]).astype(np.int16)
+        _write_cog(dev_path(cfg, cell), dev, cell,
+                   nodata=-32768, compress="zstd", predictor="yes")
+        _publish(cfg, dev_path(cfg, cell))
 
     rgb = [_stretch_abs(devs[k], valid, cfg.clip) for k in ARTWORK_RGB]
     alpha = np.where(valid, 255, 0).astype(np.uint8)
@@ -401,12 +464,7 @@ def run_cell(cell: Cell, cfg: Config) -> tuple[Cell, float]:
     _write_cog(out, np.stack(rgb + [alpha]), cell,
                colorinterp=[ColorInterp.red, ColorInterp.green, ColorInterp.blue,
                             ColorInterp.alpha], **opts)
-
-    if cfg.keep_dev:
-        dev = np.stack([np.where(valid, np.round(devs[k] * 1000).clip(-32767, 32767), -32768)
-                        for k in cfg.scales_m]).astype(np.int16)
-        _write_cog(dev_path(cfg, cell), dev, cell,
-                   nodata=-32768, compress="zstd", predictor="yes")
+    _publish(cfg, out)
     return cell, time.perf_counter() - t
 
 
@@ -478,10 +536,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--keep-dev", action="store_true", help="also write int16 DEV COGs")
     p.add_argument("--out-dir", type=Path, default=Config.out_dir)
     p.add_argument("--coarse-dir", type=Path, default=Config.coarse_dir)
+    p.add_argument("--dest", metavar="s3://BUCKET/PREFIX",
+                   help="upload each output (e.g. to R2) and delete the local copy")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--workers", type=int, default=os.cpu_count())
-    p.add_argument("--preview", type=Path, help="write a PNG mosaic of the targets")
+    p.add_argument("--preview", type=Path,
+                   help="write a PNG mosaic of the targets (local outputs only, not with --dest)")
     args = p.parse_args(argv)
+    if args.preview and args.dest:
+        p.error("--preview reads local outputs; it can't be combined with --dest")
 
     if args.world:
         targets = sorted(land_cells())
@@ -495,7 +558,7 @@ def main(argv: list[str] | None = None) -> None:
         zip(("micro", "meso", "macro"), args.scales))
     cfg = Config(scales_m=scales, block=args.block, clip=args.clip, codec=args.codec,
                  keep_dev=args.keep_dev, out_dir=args.out_dir, coarse_dir=args.coarse_dir,
-                 overwrite=args.overwrite)
+                 dest=args.dest, overwrite=args.overwrite)
     run(targets, cfg, args.workers)
     if args.preview:
         print(f"[preview] {preview(targets, cfg, args.preview)}")

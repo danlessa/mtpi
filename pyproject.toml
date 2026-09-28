@@ -16,6 +16,8 @@ dependencies = [
 [project.optional-dependencies]
 # Legacy single-AOI pipeline (mtpi.cli): UTM warp + WhiteboxTools DEV.
 legacy = ["whitebox>=2.3", "gdal>=3.10"]
+# Stream tiled outputs to R2 / S3 (mtpi.tiled --dest).
+r2 = ["boto3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
