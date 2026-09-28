@@ -11,8 +11,8 @@ Sea inside a land tile is stored as 0 m; all-ocean cells have no file.
 
 FABDEM derives from the 2021 Copernicus GLO-30 release, which withheld Armenia
 and Azerbaijan.  Those cells (``FILL_CELLS``) come from the 2023_1 GLO-30
-release (which includes them), on the same grid, via ``python -m mtpi.fill``
-into ``FILL_DIR``.
+release (which includes them), on the same grid, built by ``python -m mtpi.fill``
+and published in the FABDEM bucket under FABDEM names (for cameratopo too).
 
 License note: FABDEM is CC BY-NC-SA 4.0 -- non-commercial use only.
 """
@@ -84,11 +84,12 @@ def dem_cells() -> frozenset[tuple[int, int]]:
 
 
 def tile_source(lat: int, lon: int) -> str:
-    """GDAL path of the elevation tile for (lat, lon): FABDEM COG or COP30 fill."""
-    if (lat, lon) in FILL_CELLS:
-        path = fill_path(lat, lon)
-        if not path.exists():
-            raise FileNotFoundError(f"{path} missing: run `python -m mtpi.fill`")
+    """GDAL path of the elevation tile for (lat, lon).
+
+    FABDEM cells, and fill cells not built locally, come from the FABDEM
+    bucket (the fill is published there under FABDEM names).
+    """
+    if (lat, lon) in FILL_CELLS and (path := fill_path(lat, lon)).exists():
         return str(path)
     return "/vsicurl/" + tile_url(lat, lon)
 

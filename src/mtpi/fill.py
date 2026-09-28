@@ -68,11 +68,23 @@ def main(argv: list[str] | None = None) -> None:
                   f"void={np.mean(z == FABDEM_NODATA):.2%}", flush=True)
         if args.dest:
             import boto3
+            from botocore.exceptions import ClientError
 
+            s3 = boto3.client("s3")
             bucket, _, prefix = args.dest.removeprefix("s3://").partition("/")
             key = f"{prefix.strip('/')}/{_tile_name(*cell)}".lstrip("/")
-            boto3.client("s3").upload_file(str(path), bucket, key,
-                                           ExtraArgs={"ContentType": "image/tiff"})
+            # The destination may be the live FABDEM bucket: never clobber a
+            # real FABDEM tile (or an earlier fill) unless asked to.
+            try:
+                s3.head_object(Bucket=bucket, Key=key)
+                if not args.overwrite:
+                    print(f"[fill] s3://{bucket}/{key} exists, skipped")
+                    continue
+            except ClientError as e:
+                if e.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                    raise
+            s3.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": "image/tiff"})
+            print(f"[fill] uploaded s3://{bucket}/{key}", flush=True)
 
 
 if __name__ == "__main__":
