@@ -163,7 +163,10 @@ class Sink:
 
     def put(self, z: int, x: int, y: int, tile: np.ndarray) -> None:
         buf = io.BytesIO()
-        Image.fromarray(tile, "RGBA").save(buf, "WEBP", quality=self.quality, method=4)
+        if self.quality >= 100:  # lossless: no per-tile colour casts at tile edges
+            Image.fromarray(tile, "RGBA").save(buf, "WEBP", lossless=True, quality=80, method=4)
+        else:
+            Image.fromarray(tile, "RGBA").save(buf, "WEBP", quality=self.quality, method=4)
         rel = f"{z}/{x}/{y}.webp"
         if self.dest:
             if self._s3 is None:
@@ -238,7 +241,7 @@ def main(argv: list[str] | None = None) -> None:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--out-dir", type=Path, help="write tiles locally")
     g.add_argument("--dest", metavar="s3://BUCKET/PREFIX", help="upload tiles (e.g. to R2)")
-    p.add_argument("--quality", type=int, default=85)
+    p.add_argument("--quality", type=int, default=85, help="WebP quality; 100 = lossless")
     p.add_argument("--workers", type=int, default=os.cpu_count())
     args = p.parse_args(argv)
     build_pyramid(args.frag_dir, args.zoom, args.out_dir, args.dest, args.quality, args.workers)
