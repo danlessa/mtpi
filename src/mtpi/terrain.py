@@ -15,11 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from osgeo import gdal
-
 from .data import FABDEM_NODATA
-
-gdal.UseExceptions()
 
 
 def mosaic_and_warp(
@@ -30,6 +26,9 @@ def mosaic_and_warp(
     resample: str = "cubic",
 ) -> Path:
     """Mosaic `tile_paths` and reproject to EPSG:`dst_epsg` at `res` metres."""
+    from osgeo import gdal
+
+    gdal.UseExceptions()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # gdal.Warp mosaics a list of sources directly -- no separate BuildVRT needed.
     gdal.Warp(

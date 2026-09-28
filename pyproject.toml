@@ -11,9 +11,14 @@ dependencies = [
     "numpy>=2",
     "rasterio>=1.4",
     "matplotlib",
-    "whitebox>=2.3",
-    "gdal>=3.10",
 ]
+
+[project.optional-dependencies]
+# Legacy single-AOI pipeline (mtpi.cli): UTM warp + WhiteboxTools DEV.
+legacy = ["whitebox>=2.3", "gdal>=3.10"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mtpi = ["fabdem_cells.txt"]

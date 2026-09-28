@@ -2,9 +2,12 @@
 
 FABDEM is distributed as 1 deg x 1 deg GeoTIFF tiles named by their
 south-west corner, e.g. ``S26W050_FABDEM_V1-2.tif`` covers latitude
-[-26, -25] and longitude [-50, -49].  The global set lives in the
-GCS bucket ``gs://telhas/fabdem``.  Tiles are EPSG:4326, ~1 arc-second
-(~30 m), Float32, NoData = -9999.
+[-26, -25] and longitude [-50, -49].  The global set is served as COGs from
+Cloudflare R2 at ``FABDEM_BASE_URL`` (the same source cameratopo reads).
+Tiles are EPSG:4326, 3600 x 3600 at 1 arc-second (~30 m), Float32,
+NoData = -9999.  Pixel *centres* sit on whole arc-seconds (row 0 at the
+tile's north edge latitude), so neighbouring tiles abut with no overlap.
+Sea inside a land tile is stored as 0 m; all-ocean cells have no file.
 
 License note: FABDEM is CC BY-NC-SA 4.0 -- non-commercial use only.
 """
@@ -12,11 +15,14 @@ License note: FABDEM is CC BY-NC-SA 4.0 -- non-commercial use only.
 from __future__ import annotations
 
 import math
-import subprocess
+import shutil
+import urllib.request
 from dataclasses import dataclass
+from functools import cache
+from importlib.resources import files
 from pathlib import Path
 
-FABDEM_BUCKET = "gs://telhas/fabdem"
+FABDEM_BASE_URL = "https://fabdem.pedalhidrografi.co/"
 FABDEM_SUFFIX = "_FABDEM_V1-2.tif"
 FABDEM_NODATA = -9999.0
 
@@ -26,6 +32,28 @@ def _tile_name(lat: int, lon: int) -> str:
     ns = "N" if lat >= 0 else "S"
     ew = "E" if lon >= 0 else "W"
     return f"{ns}{abs(lat):02d}{ew}{abs(lon):03d}{FABDEM_SUFFIX}"
+
+
+def tile_url(lat: int, lon: int) -> str:
+    """HTTPS URL of the FABDEM COG whose SW corner is (lat, lon)."""
+    return FABDEM_BASE_URL + _tile_name(lat, lon)
+
+
+@cache
+def land_cells() -> frozenset[tuple[int, int]]:
+    """(lat, lon) SW corners of every 1 deg cell that has a FABDEM file.
+
+    Read from the packaged ``fabdem_cells.txt`` (the Earth Engine collection
+    listing, shared with cameratopo). A cell outside this set is open ocean.
+    """
+    cells = set()
+    for line in files("mtpi").joinpath("fabdem_cells.txt").read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        lat = int(line[1:3]) * (1 if line[0] == "N" else -1)
+        lon = int(line[4:7]) * (1 if line[3] == "E" else -1)
+        cells.add((lat, lon))
+    return frozenset(cells)
 
 
 @dataclass(frozen=True)
@@ -38,13 +66,17 @@ class AOI:
     east: float
     north: float
 
+    def cells(self) -> list[tuple[int, int]]:
+        """(lat, lon) SW corners of the 1 deg cells covering this AOI."""
+        return [
+            (lat, lon)
+            for lat in range(math.floor(self.south), math.ceil(self.north))
+            for lon in range(math.floor(self.west), math.ceil(self.east))
+        ]
+
     def tiles(self) -> list[str]:
         """FABDEM tile names (by SW corner) covering this AOI."""
-        names = []
-        for lat in range(math.floor(self.south), math.ceil(self.north)):
-            for lon in range(math.floor(self.west), math.ceil(self.east)):
-                names.append(_tile_name(lat, lon))
-        return names
+        return [_tile_name(lat, lon) for lat, lon in self.cells()]
 
     def utm_epsg(self) -> int:
         """Best-fit WGS84/UTM EPSG code for the AOI centroid."""
@@ -71,26 +103,30 @@ PRESETS: dict[str, AOI] = {
 }
 
 
-def fetch_tiles(aoi: AOI, raw_dir: Path, bucket: str = FABDEM_BUCKET) -> list[Path]:
+def fetch_tiles(aoi: AOI, raw_dir: Path, base_url: str = FABDEM_BASE_URL) -> list[Path]:
     """Download the FABDEM tiles covering `aoi` into `raw_dir` (idempotent).
 
-    Tiles that do not exist in the bucket (e.g. all-ocean cells) are skipped
+    Cells without a FABDEM file (all-ocean, per `land_cells`) are skipped
     with a warning rather than aborting the run.
     """
     raw_dir.mkdir(parents=True, exist_ok=True)
     local: list[Path] = []
     missing: list[str] = []
-    for name in aoi.tiles():
+    for lat, lon in aoi.cells():
+        name = _tile_name(lat, lon)
         dst = raw_dir / name
         if dst.exists():
             local.append(dst)
             continue
-        src = f"{bucket}/{name}"
-        # `gsutil -q stat` returns non-zero if the object does not exist.
-        if subprocess.run(["gsutil", "-q", "stat", src]).returncode != 0:
+        if (lat, lon) not in land_cells():
             missing.append(name)
             continue
-        subprocess.run(["gsutil", "-q", "cp", src, str(dst)], check=True)
+        tmp = dst.with_suffix(".part")
+        # Cloudflare rejects urllib's default User-Agent with 403.
+        req = urllib.request.Request(base_url + name, headers={"User-Agent": "mtpi"})
+        with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        tmp.replace(dst)
         local.append(dst)
     if missing:
         print(f"[fetch] {len(missing)} tile(s) absent in bucket (ocean?): {missing}")
