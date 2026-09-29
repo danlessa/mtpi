@@ -71,16 +71,10 @@ def cell_fragments(rgba: np.ndarray, cell: tuple[int, int], z: int) -> dict:
     """{(x, y): uint8 RGBA 256x256} fragments of `rgba` (4, N, N) for zoom z."""
     lat, lon = cell
     N = rgba.shape[1]
-    a = rgba[3].astype(np.float64) / 255
-    # Summed-area tables of alpha and premultiplied colour.
-    tables = []
-    for band in (a, *(rgba[k] * a for k in range(3))):
-        t = np.zeros((N + 1, N + 1))
-        np.cumsum(band, axis=0, out=t[1:, 1:])
-        np.cumsum(t[1:, 1:], axis=1, out=t[1:, 1:])
-        tables.append(t)
 
-    out = {}
+    # Per-tile footprints first, then one summed-area table at a time (alpha and
+    # premultiplied colour) so a worker never holds more than one full-size table.
+    geo = []
     for x, y in cell_tiles(cell, z):
         # Tile pixel edges -> source pixel coordinates (centre-based: col j at lon + j/N).
         ex = (np.arange(TILE + 1) / TILE + x) / 2**z * 360 - 180
@@ -100,9 +94,21 @@ def cell_fragments(rgba: np.ndarray, cell: tuple[int, int], z: int) -> dict:
         thin = r1 <= r0
         r0[thin] = np.clip(np.floor(my[thin] + 0.5).astype(np.int64), 0, N - 1)
         r1[thin] = r0[thin] + 1
+        geo.append((x, y, r0, r1, c0, c1, own_x, own_y, []))
+
+    a = rgba[3].astype(np.float64) / 255
+    t = np.zeros((N + 1, N + 1))
+    for k in (None, 0, 1, 2):
+        band = a if k is None else rgba[k] * a
+        np.cumsum(band, axis=0, out=t[1:, 1:])
+        np.cumsum(t[1:, 1:], axis=1, out=t[1:, 1:])
+        for _, _, r0, r1, c0, c1, _, _, sums in geo:
+            sums.append(t[np.ix_(r1, c1)] - t[np.ix_(r0, c1)] - t[np.ix_(r1, c0)] + t[np.ix_(r0, c0)])
+        del band
+
+    out = {}
+    for x, y, r0, r1, c0, c1, own_x, own_y, sums in geo:
         count = np.outer(r1 - r0, c1 - c0)
-        sums = [t[np.ix_(r1, c1)] - t[np.ix_(r0, c1)] - t[np.ix_(r1, c0)] + t[np.ix_(r0, c0)]
-                for t in tables]
         sa = sums[0]
         frag = np.zeros((TILE, TILE, 4), np.uint8)
         with np.errstate(invalid="ignore", divide="ignore"):
@@ -116,12 +122,18 @@ def cell_fragments(rgba: np.ndarray, cell: tuple[int, int], z: int) -> dict:
     return out
 
 
-def write_fragments(frags: dict, cell_name: str, frag_dir: Path, z: int) -> None:
+def write_fragments(frags: dict, cell_name: str, frag_dir: Path, z: int,
+                    fmt: str = "png") -> None:
+    """Fragments as lossless PNG (default) or lossless WebP (smaller, for big zooms)."""
     for (x, y), frag in frags.items():
-        path = frag_dir / str(z) / str(x) / str(y) / f"{cell_name}.png"
+        path = frag_dir / str(z) / str(x) / str(y) / f"{cell_name}.{fmt}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp.png")
-        Image.fromarray(frag, "RGBA").save(tmp)
+        tmp = path.with_suffix(f".tmp.{fmt}")
+        if fmt == "webp":
+            Image.fromarray(frag, "RGBA").save(tmp, "WEBP", lossless=True, quality=0, method=0,
+                                               exact=True)
+        else:
+            Image.fromarray(frag, "RGBA").save(tmp)
         tmp.replace(path)
 
 
@@ -131,7 +143,7 @@ def write_fragments(frags: dict, cell_name: str, frag_dir: Path, z: int) -> None
 def _merge(dirs: list[Path]) -> np.ndarray:
     acc = np.zeros((TILE, TILE, 4), np.uint16)
     for d in dirs:
-        for f in d.glob("*.png"):
+        for f in [*d.glob("*.png"), *d.glob("*.webp")]:
             acc += np.asarray(Image.open(f).convert("RGBA"), np.uint16)
     return acc.clip(0, 255).astype(np.uint8)
 
@@ -195,12 +207,12 @@ def _init(out_dir, dest, quality):
 
 
 def _leaf(args) -> tuple[tuple[int, int], np.ndarray | None]:
-    z, (x, y), dirs = args
+    z, (x, y), dirs, keep = args
     tile = _merge(dirs)
     if not tile[..., 3].any():
         return (x, y), None
     _SINK.put(z, x, y, tile)
-    return (x, y), tile
+    return (x, y), tile if keep else True
 
 
 def _parent(args) -> tuple[tuple[int, int], np.ndarray | None]:
@@ -213,16 +225,18 @@ def _parent(args) -> tuple[tuple[int, int], np.ndarray | None]:
 
 
 def build_pyramid(frag_dir: Path, zoom: int, out_dir: Path | None, dest: str | None,
-                  quality: int = 85, workers: int = os.cpu_count() or 1) -> None:
+                  quality: int = 85, workers: int = os.cpu_count() or 1,
+                  min_zoom: int = 0) -> None:
+    """Tiles at `zoom` from fragments, then parents down to `min_zoom`."""
     root = frag_dir / str(zoom)
     leaves = sorted((int(d.parent.name), int(d.name), d) for d in root.glob("*/*") if d.is_dir())
-    jobs = [(zoom, (x, y), [d]) for x, y, d in leaves]
+    jobs = [(zoom, (x, y), [d], min_zoom < zoom) for x, y, d in leaves]
     t0 = time.perf_counter()
     with Pool(workers, initializer=_init, initargs=(out_dir, dest, quality)) as pool:
         level = {k: t for k, t in pool.imap_unordered(_leaf, jobs, chunksize=64)
                  if t is not None}
         print(f"[xyz] z{zoom}: {len(level)} tiles ({time.perf_counter() - t0:.0f}s)", flush=True)
-        for z in range(zoom - 1, -1, -1):
+        for z in range(zoom - 1, min_zoom - 1, -1):
             parents = defaultdict(dict)
             for (x, y), t in level.items():
                 parents[x // 2, y // 2][x, y] = t
@@ -242,9 +256,11 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--out-dir", type=Path, help="write tiles locally")
     g.add_argument("--dest", metavar="s3://BUCKET/PREFIX", help="upload tiles (e.g. to R2)")
     p.add_argument("--quality", type=int, default=85, help="WebP quality; 100 = lossless")
+    p.add_argument("--min-zoom", type=int, default=0, help="stop building parents below this zoom")
     p.add_argument("--workers", type=int, default=os.cpu_count())
     args = p.parse_args(argv)
-    build_pyramid(args.frag_dir, args.zoom, args.out_dir, args.dest, args.quality, args.workers)
+    build_pyramid(args.frag_dir, args.zoom, args.out_dir, args.dest, args.quality, args.workers,
+                  args.min_zoom)
 
 
 if __name__ == "__main__":
