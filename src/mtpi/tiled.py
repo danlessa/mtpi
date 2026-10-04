@@ -61,7 +61,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -658,9 +658,17 @@ def _star(args):
 def _map(fn, cells: list[Cell], cfg: Config, workers: int, label: str) -> list[Cell]:
     """Run `fn` over `cells`; returns the cells that failed (rerun to retry them)."""
     failed, t0 = [], time.perf_counter()
-    with Pool(workers) as pool:
-        jobs = [(fn, c, cfg) for c in cells]
-        for i, (cell, dt, err) in enumerate(pool.imap_unordered(_star, jobs), 1):
+    # ProcessPoolExecutor, not multiprocessing.Pool: if a worker dies (e.g. OOM-killed) Pool
+    # silently loses its task and the run hangs; here the futures fail and are reported.
+    # No max_tasks_per_child: when workers hit it together, CPython 3.12's executor can fail to
+    # start their replacements and hang (seen at exactly workers x 50 cells).
+    with ProcessPoolExecutor(workers) as pool:
+        futs = {pool.submit(_star, (fn, c, cfg)): c for c in cells}
+        for i, fut in enumerate(as_completed(futs), 1):
+            try:
+                cell, dt, err = fut.result()
+            except Exception as e:  # BrokenProcessPool: worker died
+                cell, dt, err = futs[fut], 0.0, f"{type(e).__name__}: {e}"
             if err:
                 failed.append(cell)
                 print(f"[{label}] {i}/{len(cells)} {cell_name(cell)} FAILED {err}", flush=True)

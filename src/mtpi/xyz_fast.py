@@ -283,7 +283,8 @@ def main(argv=None) -> None:
         except Exception as e:  # e.g. BrokenProcessPool: a worker died (OOM?) -> fail, rerun retries
             finish(job, 0, 0, f"{type(e).__name__}: {e}")
 
-    with ProcessPoolExecutor(args.workers, initializer=_init_worker, max_tasks_per_child=25) as pool:
+    # No max_tasks_per_child (CPython 3.12 can hang replacing recycled workers).
+    with ProcessPoolExecutor(args.workers, initializer=_init_worker) as pool:
         for job in jobs:
             inflight.acquire()
             try:
