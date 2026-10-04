@@ -176,7 +176,8 @@ class Sink:
     def put(self, z: int, x: int, y: int, tile: np.ndarray) -> None:
         buf = io.BytesIO()
         if self.quality >= 100:  # lossless: no per-tile colour casts at tile edges
-            Image.fromarray(tile, "RGBA").save(buf, "WEBP", lossless=True, quality=80, method=4)
+            # fastest lossless effort: ~3.5 ms vs ~160 ms per tile, ~16% larger
+            Image.fromarray(tile, "RGBA").save(buf, "WEBP", lossless=True, quality=0, method=0)
         else:
             Image.fromarray(tile, "RGBA").save(buf, "WEBP", quality=self.quality, method=4)
         rel = f"{z}/{x}/{y}.webp"
@@ -191,7 +192,7 @@ class Sink:
             key = f"{prefix.strip('/')}/{rel}".lstrip("/")
             self._s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue(),
                                 ContentType="image/webp",
-                                CacheControl="public, max-age=31536000, immutable")
+                                CacheControl="public, max-age=604800")  # 7 days: re-renders reuse URLs
         else:
             path = self.out_dir / rel
             path.parent.mkdir(parents=True, exist_ok=True)

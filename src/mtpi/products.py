@@ -38,6 +38,7 @@ from .tiled import DATA, N, Cell, cell_name, dem_cells, wrap_lon
 
 # band name -> (smallest, largest window in metres, window sizes per decade)
 BANDS: dict[str, tuple[float, float, int]] = {
+    "0.03-0.3km": (30.0, 300.0, 6),
     "0.3-3km": (300.0, 3e3, 6),
     "3-30km": (3e3, 3e4, 8),
     "30-300km": (3e4, 3e5, 12),
@@ -55,10 +56,19 @@ class Product:
     dev: tuple[str, ...]  # band names kept in dev/
 
 
-PRODUCTS = (
-    Product("v1", rgb=("30-300km", "3-30km", "0.3-3km"), dev=("0.3-3km", "3-30km", "30-300km")),
-    Product("v2", rgb=("300-3000km", "30-300km", "3-30km"), dev=("300-3000km",)),
-)
+ALL_PRODUCTS = {
+    # v0: local landforms. Its 0.3-3 and 3-30 km bands equal v1's, so only the new band is kept.
+    "v0": Product("v0", rgb=("3-30km", "0.3-3km", "0.03-0.3km"), dev=("0.03-0.3km",)),
+    "v1": Product("v1", rgb=("30-300km", "3-30km", "0.3-3km"), dev=("0.3-3km", "3-30km", "30-300km")),
+    "v2": Product("v2", rgb=("300-3000km", "30-300km", "3-30km"), dev=("300-3000km",)),
+}
+PRODUCTS = (ALL_PRODUCTS["v1"], ALL_PRODUCTS["v2"])  # default run (the 2026-09-28 world run)
+
+
+def bands_for(products) -> dict:
+    """Only the bands the given products use (fewer window sizes to compute)."""
+    names = {k for p in products for k in (*p.rgb, *p.dev)}
+    return {k: v for k, v in BANDS.items() if k in names}
 
 
 def scales_for(bands: dict) -> list[float]:
@@ -189,6 +199,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--xyz-zoom", type=int, default=9, help="-1 disables tile fragments")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--workers", type=int, default=os.cpu_count())
+    p.add_argument("--products", nargs="+", choices=sorted(ALL_PRODUCTS), default=["v1", "v2"])
     args = p.parse_args(argv)
 
     if args.world:
@@ -198,7 +209,9 @@ def main(argv: list[str] | None = None) -> None:
     else:
         by_name = {cell_name(c): c for c in dem_cells()}
         targets = sorted(by_name[n] for n in args.cells)
-    job = Job(codec=args.codec, dest_root=args.dest_root, out_root=args.out_root,
+    prods = tuple(ALL_PRODUCTS[k] for k in args.products)
+    job = Job(products=prods, bands=bands_for(prods),
+              codec=args.codec, dest_root=args.dest_root, out_root=args.out_root,
               frag_root=args.frag_root, xyz_zoom=None if args.xyz_zoom < 0 else args.xyz_zoom,
               overwrite=args.overwrite)
     if run(targets, job, args.workers):
